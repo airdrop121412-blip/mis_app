@@ -1,0 +1,41 @@
+# Build/runtime noise (never commit)
+vendor/
+node_modules/
+*.log
+storage/logs/*
+!storage/logs/.gitignore
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+storage/app/public/*
+bootstrap/cache/*.php
+.phpunit.result.cache
+.phpunit.cache/
+public/build/
+public/hot/
+public/storage/
+
+# Local secrets (Railway provides these as variables)
+.env
+.env.backup
+.env.production
+.env.*.local
+/auth.json
+/storage/*.key
+storage/pail/
+
+# Local debug/throwaway scripts and dumps (keep migrations only)
+check_*.php
+demo_*.php
+force_rollback.php
+rollback_*.php
+show_*.php
+temp_check.php
+update_password.php
+_restore_wiz.py
+fix_*.py
+full-test-out.txt
+serve*.log
+server_start*.log
+*.accdb
+*.zip
