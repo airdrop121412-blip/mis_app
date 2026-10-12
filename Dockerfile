@@ -1,4 +1,4 @@
-FROM php:8.2-apache
+FROM php:8.4-apache
 
 # System deps + PHP extensions required by this Laravel 12 app
 # (pdo_mysql, mbstring, zip, gd, intl, bcmath, opcache).
