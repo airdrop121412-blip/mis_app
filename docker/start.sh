@@ -19,8 +19,12 @@ if grep -q '^APP_KEY=.\+' .env 2>/dev/null; then
   php artisan config:cache --no-ansi || true
   php artisan route:cache --no-ansi || true
   php artisan view:cache --no-ansi || true
-  # Run the 48 tracked migrations (safe: migrate --force never rewrites history).
-  php artisan migrate --force --no-ansi || echo 'WARNING: migrate failed; check DB_* vars, then redeploy.'
+# DEPLOYMENT STEP IS SEPARATED: migration does not run at launch.
+# After you have verified the production database, backed it up, and reviewed
+# the migrations, run explicitly:
+#   docker compose exec web php artisan migrate --force
+# Run `php artisan migrate --force --seed` only for master/demo data, after
+# review. Never leave `migrate --force` inside the container launch script.
 else
   echo 'WARNING: APP_KEY is empty; set it in Railway variables before use.'
 fi
