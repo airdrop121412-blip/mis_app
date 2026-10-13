@@ -226,7 +226,7 @@ class ProjectTest extends TestCase
         $this->getJson('/api/v1/projects')->assertStatus(401);
     }
 
-    public function test_user_without_permission_returns_403(): void
+    public function test_user_without_permission_cannot_create_project(): void
     {
         $user = User::factory()->create([
             'username' => 'proj_noperm_'.fake()->unique()->numerify('#####'),
@@ -239,8 +239,28 @@ class ProjectTest extends TestCase
         ]);
         $token = $response->json('data.token');
 
+        // GET list is intentionally open to any authenticated user (the project
+        // picker — routes/api/v1.php §Projects), so a role-less user may read it.
         $this->withHeader('Authorization', 'Bearer '.$token)
             ->getJson('/api/v1/projects')
+            ->assertOk();
+
+        // Create/update/delete require master.manage — a user with no roles
+        // must NOT be able to create a project.
+        $this->withHeader('Authorization', 'Bearer '.$token)
+            ->postJson('/api/v1/projects', [
+                'project_code' => 'NOPERM_'.fake()->unique()->numerify('#####'),
+                'name' => 'No Permission Project '.fake()->unique()->numerify('#####'),
+            ])
             ->assertStatus(403);
+
+        // Update is equally gated (only asserted when a project exists, since
+        // route-model binding would otherwise 404 before the middleware).
+        $existingId = DB::table('project')->orderBy('project_id')->value('project_id');
+        if ($existingId !== null) {
+            $this->withHeader('Authorization', 'Bearer '.$token)
+                ->putJson("/api/v1/projects/{$existingId}", ['name' => 'Hacked'])
+                ->assertStatus(403);
+        }
     }
 }
