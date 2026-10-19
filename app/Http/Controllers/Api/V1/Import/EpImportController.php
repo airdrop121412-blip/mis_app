@@ -24,6 +24,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
@@ -768,14 +769,19 @@ class EpImportController extends Controller
         $projectId = (int) $request->input('project_id');
         $file = $request->file('file');
 
+        $sheetName = self::SHEET_NAMES[$step];
+
+        // Parse ONLY this step's sheet, streaming straight from the zip.
+        // Re-reading and DOM-parsing every sheet of the workbook on each
+        // single-step upload used to burn minutes of CPU and hundreds of MB
+        // before the first row was inserted — on production that outlived the
+        // platform's request/memory window, the connection was dropped, and
+        // the browser only saw a generic "Network error".
         try {
-            $sheets = XlsxReader::readSheets($file->getRealPath());
+            $rows = XlsxReader::readSheet($file->getRealPath(), $sheetName);
         } catch (\InvalidArgumentException $e) {
             return ApiResponse::error($e->getMessage(), 'INVALID_XLSX');
         }
-
-        $sheetName = self::SHEET_NAMES[$step];
-        $rows = $sheets[$sheetName] ?? [];
 
         if (empty($rows)) {
             return ApiResponse::error(
@@ -861,7 +867,30 @@ class EpImportController extends Controller
         ));
         $report['unknown_columns'] = array_values(array_unique($unknownColumns));
 
-        $rules = AffectedPersonStoreRequest::epRules($projectId);
+        // Speed-critical prefetching: this import runs row-by-row over the
+        // WAN link to the database, and every per-row SELECT issued by the
+        // rules or the ID prefix cost a full network round-trip (~10-15 of
+        // them per row before this). The lookups below are fetched ONCE and
+        // checked in memory; semantics and error messages are unchanged.
+        $rules = self::memoizeExistsRules(AffectedPersonStoreRequest::epRules($projectId));
+
+        // In-memory replacement for the per-row Rule::unique(nid_number):
+        // the project's existing NIDs up front, plus every NID successfully
+        // imported earlier in this run (identical to the DB-backed rule,
+        // which also only ever saw committed rows).
+        $usedNids = array_flip(
+            DB::table('affected_person')
+                ->where('project_id', $projectId)
+                ->whereNotNull('nid_number')
+                ->pluck('nid_number')
+                ->all()
+        );
+        if (isset($rules['nid_number']) && is_array($rules['nid_number'])) {
+            $rules['nid_number'] = array_values(array_filter(
+                $rules['nid_number'],
+                static fn ($rule): bool => ! $rule instanceof \Illuminate\Validation\Rule\Unique
+            ));
+        }
 
         // rc_type_id is an optional template column (name, code or ID, e.g.
         // Residential / Commercial / Both). A blank cell defaults the EP to
@@ -870,6 +899,10 @@ class EpImportController extends Controller
             ->where('code', 'RESIDENTIAL')
             ->where('is_active', 1)
             ->value('rc_type_id') ?? 1);
+
+        // Ownership → land-status fallback runs per row below; load the
+        // active rows once instead of re-querying on every row.
+        $landStatusOptions = DB::table('land_status')->where('is_active', 1)->get();
 
         foreach (array_slice($rows, 1) as $rowIndex => $row) {
             $excelRow = $rowIndex + 2;
@@ -901,12 +934,11 @@ class EpImportController extends Controller
                 continue;
             }
 
-            // Auto-derive land_status_id from ownership text when not provided.
+            // Auto-derive land_status_id from ownership text when not provided
+            // (rows preloaded above — no per-row query).
             if (empty($data['land_status_id']) && !empty($data['ownership'])) {
                 $normalized = mb_strtolower(preg_replace('/[\s\-]+/', '', $data['ownership']));
-                $match = DB::table('land_status')
-                    ->where('is_active', 1)
-                    ->get()
+                $match = $landStatusOptions
                     ->first(fn ($s) => preg_replace('/[\s\-]+/', '', mb_strtolower($s->name)) === $normalized);
                 if ($match) {
                     $data['land_status_id'] = (int) $match->land_status_id;
@@ -915,6 +947,19 @@ class EpImportController extends Controller
 
             // Blank/absent rc_type_id falls back to RESIDENTIAL.
             $data['rc_type_id'] ??= $defaultRcTypeId;
+
+            // In-memory replacement for the removed unique:nid_number rule.
+            $nid = trim((string) ($data['nid_number'] ?? ''));
+            if ($nid !== '' && isset($usedNids[$nid])) {
+                $report['errors'][] = [
+                    'row' => $excelRow,
+                    'sheet' => 'ep',
+                    'name' => (string) ($data['name'] ?? ''),
+                    'errors' => ['nid_number' => ['The nid number has already been taken.']],
+                ];
+
+                continue;
+            }
 
             $validator = Validator::make($data, $rules);
             if ($validator->fails()) {
@@ -960,6 +1005,9 @@ class EpImportController extends Controller
 
                 $report['imported']++;
                 $report['imported_ids'][] = $ep->affected_person_id;
+                if ($nid !== '') {
+                    $usedNids[$nid] = true;
+                }
             } catch (\Throwable $e) {
                 $report['errors'][] = [
                     'row' => $excelRow,
@@ -973,6 +1021,44 @@ class EpImportController extends Controller
         $report['skipped'] = count($report['errors']);
 
         return $report;
+    }
+
+    /**
+     * Replace every string 'exists:table,column' validation rule with an
+     * in-memory Rule::in() fed by ONE pluck() per table, issued before the
+     * row loop. Laravel's exists and in rules report the exact same message
+     * ("The selected :attribute is invalid."), so row errors are unchanged —
+     * only the per-row SELECT … EXISTS round-trips disappear. Rules this
+     * helper does not recognise are left untouched (still correct, just not
+     * memoised).
+     *
+     * @param  array<string, mixed> $rules
+     * @return array<string, mixed>
+     */
+    private static function memoizeExistsRules(array $rules): array
+    {
+        $cache = [];
+
+        foreach ($rules as $field => $fieldRules) {
+            if (! is_array($fieldRules)) {
+                $fieldRules = [$fieldRules];
+            }
+
+            foreach ($fieldRules as $i => $rule) {
+                if (is_string($rule)
+                    && preg_match('/^exists:([A-Za-z0-9_]+),([A-Za-z0-9_]+)$/', $rule, $m)) {
+                    $key = $m[1].','.$m[2];
+                    if (! array_key_exists($key, $cache)) {
+                        $cache[$key] = DB::table($m[1])->pluck($m[2])->all();
+                    }
+                    $fieldRules[$i] = Rule::in($cache[$key]);
+                }
+            }
+
+            $rules[$field] = $fieldRules;
+        }
+
+        return $rules;
     }
 
     // ── Child sheets ─────────────────────────────────────────────

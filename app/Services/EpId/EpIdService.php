@@ -52,6 +52,25 @@ class EpIdService
     private array $epIdLookupCache = [];
 
     /**
+     * Per-request cache of master models keyed "type:id". buildPrefix()
+     * resolves the same district/upazila/land-status/project rows on EVERY
+     * imported row — caching them removes four WAN round-trips per row
+     * during bulk imports (they are static configuration data and cannot
+     * change within a single request).
+     *
+     * @var array<string, District|Upazila|LandStatus|Project>
+     */
+    private array $modelCache = [];
+
+    /**
+     * Per-request cache of resolved epid codes keyed "category|name|projectId".
+     * codeFor() ran one SELECT per lookup per row; codes are admin-configured
+     * and stable within a request, so results are memoised (misses — the
+     * EP_ID_CODE_MISSING exception — are never cached).
+     */
+    private array $codeCache = [];
+
+    /**
      * Generate a unique EP ID for the given project and geo-location.
      *
      * @param  string|null  $lossCategory  affected_person.category_of_loss
@@ -125,10 +144,10 @@ class EpIdService
         ?string $ownership = null,
         ?string $phase = null,
     ): string {
-        $district = District::findOrFail($districtId);
-        $upazila = Upazila::findOrFail($upazilaId);
-        $landStatus = LandStatus::findOrFail($landStatusId);
-        $project = Project::findOrFail($projectId);
+        $district = $this->cachedModel('district', $districtId);
+        $upazila = $this->cachedModel('upazila', $upazilaId);
+        $landStatus = $this->cachedModel('land_status', $landStatusId);
+        $project = $this->cachedModel('project', $projectId);
 
         $districtCode = $this->codeFor(EpidCode::CATEGORY_DISTRICT, $district->name, $projectId);
         $upazilaCode = str_pad($this->codeFor(EpidCode::CATEGORY_UPAZILA, $upazila->name, $projectId), 2, '0', STR_PAD_LEFT);
@@ -210,14 +229,14 @@ class EpIdService
         ?string $ownership = null,
         ?string $phase = null,
     ): string {
-        $project = Project::findOrFail($projectId);
+        $project = $this->cachedModel('project', $projectId);
 
         $districtCode = $districtId !== null
-            ? $this->codeFor(EpidCode::CATEGORY_DISTRICT, District::findOrFail($districtId)->name, $projectId)
+            ? $this->codeFor(EpidCode::CATEGORY_DISTRICT, $this->cachedModel('district', $districtId)->name, $projectId)
             : '0';
 
         $upazilaCode = $upazilaId !== null
-            ? str_pad($this->codeFor(EpidCode::CATEGORY_UPAZILA, Upazila::findOrFail($upazilaId)->name, $projectId), 2, '0', STR_PAD_LEFT)
+            ? str_pad($this->codeFor(EpidCode::CATEGORY_UPAZILA, $this->cachedModel('upazila', $upazilaId)->name, $projectId), 2, '0', STR_PAD_LEFT)
             : '00';
 
         $phaseName = $phase ?? $project->phase;
@@ -231,7 +250,7 @@ class EpIdService
         );
 
         if ($landStatusId !== null) {
-            $titleName = $this->canonicalTitleName($ownership, LandStatus::findOrFail($landStatusId)->name);
+            $titleName = $this->canonicalTitleName($ownership, $this->cachedModel('land_status', $landStatusId)->name);
         } else {
             $titleName = $this->canonicalTitleName($ownership, '');
         }
@@ -346,6 +365,11 @@ class EpIdService
      */
     private function codeFor(string $category, string $name, ?int $projectId = null): string
     {
+        $cacheKey = $category.'|'.$name.'|'.($projectId ?? '');
+        if (isset($this->codeCache[$cacheKey])) {
+            return $this->codeCache[$cacheKey];
+        }
+
         $query = EpidCode::query()
             ->active()
             ->where('category', $category)
@@ -366,7 +390,31 @@ class EpIdService
             );
         }
 
-        return $code;
+        return $this->codeCache[$cacheKey] = $code;
+    }
+
+    /**
+     * Master-model lookup with a per-request cache (see $modelCache).
+     * findOrFail() semantics are preserved exactly — a missing id still
+     * throws ModelNotFoundException on first access.
+     *
+     * @return District|Upazila|LandStatus|Project
+     */
+    private function cachedModel(string $type, int $id): District|Upazila|LandStatus|Project
+    {
+        $key = $type.':'.$id;
+
+        if (! array_key_exists($key, $this->modelCache)) {
+            $this->modelCache[$key] = match ($type) {
+                'district' => District::findOrFail($id),
+                'upazila' => Upazila::findOrFail($id),
+                'land_status' => LandStatus::findOrFail($id),
+                'project' => Project::findOrFail($id),
+                default => throw new \InvalidArgumentException("Unknown cached model type '{$type}'."),
+            };
+        }
+
+        return $this->modelCache[$key];
     }
 
     /**
