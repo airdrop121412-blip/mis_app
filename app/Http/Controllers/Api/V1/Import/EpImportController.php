@@ -24,8 +24,6 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -739,7 +737,6 @@ class EpImportController extends Controller
                 }
             }],
             'file'       => ['required', 'file', 'mimes:xlsx'],
-            'upload_key' => ['nullable', 'string'],
             'offset'     => ['nullable', 'integer', 'min:0'],
             'batch_size' => ['nullable', 'integer', 'min:1', 'max:500'],
         ], [
@@ -770,38 +767,25 @@ class EpImportController extends Controller
         $file = $request->file('file');
         $sheetName = self::SHEET_NAMES[$step];
 
-        // ── Chunked (continuation) import ─────────────────────────────
-        // One HTTP request = one batch. Parsed rows are cached server-side
-        // under upload_key so we never re-parse the file on subsequent
-        // batch requests. Every request stays well under the platform
-        // request timeout — no single request ever approaches the limit.
-        $uploadKey = $request->input('upload_key');
-        $offset    = (int) $request->input('offset', 0);
-        $batchSize = (int) $request->input('batch_size', 50);
+        // ── Chunked (continuation) import — stateless ─────────────────
+        // Each request re-parses the sheet (fast streaming, ~7 s for
+        // 10k rows × 70 cols), slices one batch by offset, and inserts it.
+        // No server-side cache or session is used, so nothing can expire
+        // mid-import and no single request approaches the platform timeout.
+        $offset   = (int) $request->input('offset', 0);
+        $batchSize = (int) $request->input('batch_size', 25);
 
-        if ($uploadKey === null) {
-            try {
-                $rows = XlsxReader::readSheet($file->getRealPath(), $sheetName);
-            } catch (\InvalidArgumentException $e) {
-                return ApiResponse::error($e->getMessage(), 'INVALID_XLSX');
-            }
-            if (empty($rows)) {
-                return ApiResponse::error(
-                    "No data found in the «{$sheetName}» sheet. Ensure the first row has the field headers and the sheet is not empty.",
-                    'SHEET_EMPTY',
-                );
-            }
-            $uploadKey = (string) Str::uuid();
-            Cache::put("import_rows:{$uploadKey}", $rows, now()->addMinutes(30));
-        } else {
-            $rows = Cache::get("import_rows:{$uploadKey}");
-            if ($rows === null) {
-                return ApiResponse::error(
-                    'Upload session expired. Please re-upload the file.',
-                    'UPLOAD_SESSION_EXPIRED',
-                    410,
-                );
-            }
+        try {
+            $rows = XlsxReader::readSheet($file->getRealPath(), $sheetName);
+        } catch (\InvalidArgumentException $e) {
+            return ApiResponse::error($e->getMessage(), 'INVALID_XLSX');
+        }
+
+        if (empty($rows)) {
+            return ApiResponse::error(
+                "No data found in the «{$sheetName}» sheet. Ensure the first row has the field headers and the sheet is not empty.",
+                'SHEET_EMPTY',
+            );
         }
 
         $totalDataRows = count($rows) - 1; // minus header row
@@ -847,7 +831,6 @@ class EpImportController extends Controller
         return ApiResponse::success([
             'step'               => $step,
             'sheet_name'         => self::SHEET_NAMES[$step],
-            'upload_key'         => $uploadKey,
             'total_rows'         => $totalDataRows,
             'imported'           => $report['imported'],
             'skipped'            => $report['skipped'],
