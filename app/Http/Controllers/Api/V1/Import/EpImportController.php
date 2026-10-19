@@ -24,6 +24,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -737,6 +739,9 @@ class EpImportController extends Controller
                 }
             }],
             'file'       => ['required', 'file', 'mimes:xlsx'],
+            'upload_key' => ['nullable', 'string'],
+            'offset'     => ['nullable', 'integer', 'min:0'],
+            'batch_size' => ['nullable', 'integer', 'min:1', 'max:500'],
         ], [
             'project_id.required' => 'Select a project before importing.',
             'project_id.exists'   => 'The selected project no longer exists — reload and pick another.',
@@ -761,61 +766,95 @@ class EpImportController extends Controller
         ini_set('max_execution_time', 0);
         ini_set('memory_limit', '-1');
 
-        // Lazy-load cross-sheet state — the EP step needs neither the EP
-        // index nor the parent-key state, and the GPS step only needs the
-        // EP index. Building them unconditionally means four extra JOIN
-        // queries against every table on every step, which is wasted work
-        // for the most common steps.
         $projectId = (int) $request->input('project_id');
         $file = $request->file('file');
-
         $sheetName = self::SHEET_NAMES[$step];
 
-        // Parse ONLY this step's sheet, streaming straight from the zip.
-        // Re-reading and DOM-parsing every sheet of the workbook on each
-        // single-step upload used to burn minutes of CPU and hundreds of MB
-        // before the first row was inserted — on production that outlived the
-        // platform's request/memory window, the connection was dropped, and
-        // the browser only saw a generic "Network error".
-        try {
-            $rows = XlsxReader::readSheet($file->getRealPath(), $sheetName);
-        } catch (\InvalidArgumentException $e) {
-            return ApiResponse::error($e->getMessage(), 'INVALID_XLSX');
+        // ── Chunked (continuation) import ─────────────────────────────
+        // One HTTP request = one batch. Parsed rows are cached server-side
+        // under upload_key so we never re-parse the file on subsequent
+        // batch requests. Every request stays well under the platform
+        // request timeout — no single request ever approaches the limit.
+        $uploadKey = $request->input('upload_key');
+        $offset    = (int) $request->input('offset', 0);
+        $batchSize = (int) $request->input('batch_size', 50);
+
+        if ($uploadKey === null) {
+            try {
+                $rows = XlsxReader::readSheet($file->getRealPath(), $sheetName);
+            } catch (\InvalidArgumentException $e) {
+                return ApiResponse::error($e->getMessage(), 'INVALID_XLSX');
+            }
+            if (empty($rows)) {
+                return ApiResponse::error(
+                    "No data found in the «{$sheetName}» sheet. Ensure the first row has the field headers and the sheet is not empty.",
+                    'SHEET_EMPTY',
+                );
+            }
+            $uploadKey = (string) Str::uuid();
+            Cache::put("import_rows:{$uploadKey}", $rows, now()->addMinutes(30));
+        } else {
+            $rows = Cache::get("import_rows:{$uploadKey}");
+            if ($rows === null) {
+                return ApiResponse::error(
+                    'Upload session expired. Please re-upload the file.',
+                    'UPLOAD_SESSION_EXPIRED',
+                    410,
+                );
+            }
         }
 
-        if (empty($rows)) {
+        $totalDataRows = count($rows) - 1; // minus header row
+        if ($totalDataRows <= 0) {
             return ApiResponse::error(
                 "No data found in the «{$sheetName}» sheet. Ensure the first row has the field headers and the sheet is not empty.",
                 'SHEET_EMPTY',
             );
         }
 
+        // Slice one batch of data rows (skip header at index 0).
+        $dataRows = array_slice($rows, 1);
+        $batchData = array_slice($dataRows, $offset, $batchSize);
+        $batchRows = array_merge([$rows[0]], $batchData);
+
+        $done = ($offset + $batchSize) >= $totalDataRows;
+        $nextOffset = $done ? null : $offset + $batchSize;
+
         $epIndex = null;
         $state   = null;
 
         if ($step === 'ep') {
-            $report = $this->importEpSheet($rows, $projectId);
+            $report = $this->importEpSheet($batchRows, $projectId);
         } elseif ($step === 'gps') {
             $epIndex = $this->epIndexByParentKeys($projectId);
-            $report = $this->importGpsSheet($rows, $epIndex);
+            $report = $this->importGpsSheet($batchRows, $epIndex);
         } else {
             $epIndex = $this->epIndexByParentKeys($projectId);
             $state   = $this->buildStateFromDb($projectId);
-            $report = $this->importChildSheet($step, $rows, $epIndex, $state);
+            $report = $this->importChildSheet($step, $batchRows, $epIndex, $state);
         }
 
         $report['skipped'] = count($report['errors']);
 
-        $message = $report['skipped'] > 0
-            ? "Imported {$report['imported']} of {$report['total']} rows; {$report['skipped']} row(s) skipped."
-            : "Imported {$report['imported']} of {$report['total']} rows.";
+        $message = sprintf(
+            'Imported %d of %d rows (offset %d%s).',
+            $report['imported'],
+            $totalDataRows,
+            $offset,
+            $done ? ' — complete' : ', more batches remain'
+        );
 
         return ApiResponse::success([
             'step'               => $step,
             'sheet_name'         => self::SHEET_NAMES[$step],
-            'total'              => $report['total'],
+            'upload_key'         => $uploadKey,
+            'total_rows'         => $totalDataRows,
             'imported'           => $report['imported'],
             'skipped'            => $report['skipped'],
+            'offset'             => $offset,
+            'next_offset'        => $nextOffset,
+            'batch_size'         => $batchSize,
+            'done'               => $done,
             'missing_columns'    => $report['missing_columns'],
             'unknown_columns'    => $report['unknown_columns'],
             'errors'             => $report['errors'],
